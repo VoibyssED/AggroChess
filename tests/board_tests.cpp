@@ -68,6 +68,65 @@ void testEmptyAndPieceTypes() {
     assert(position.toFen() == "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 99 100");
 }
 
+void testPositionAccess() {
+    const Position position = Position::startPosition();
+    assert(position.pieceTypeAt(Square::A1) == PieceType::Rook);
+    assert(position.pieceTypeAt(Square::E2) == PieceType::Pawn);
+    assert(position.pieceTypeAt(Square::E4) == PieceType::Count);
+    assert(position.pieceTypeAt(Square::None) == PieceType::Count);
+    assert(position.colorAt(Square::A1) == Color::White);
+    assert(position.colorAt(Square::A8) == Color::Black);
+    assert(position.kingSquare(Color::White) == Square::E1);
+    assert(position.kingSquare(Color::Black) == Square::E8);
+
+    bool threw = false;
+    try { (void)position.colorAt(Square::E4); }
+    catch (const std::invalid_argument&) { threw = true; }
+    assert(threw);
+}
+
+void testConsistencyAndLegalityAreDistinct() {
+    const Position start = Position::startPosition();
+    assert(start.isInternallyConsistent());
+    assert(start.isLegalPosition());
+
+    const Position empty = Position::fromFen("8/8/8/8/8/8/8/8 w - - 0 1");
+    assert(empty.isInternallyConsistent());
+    assert(!empty.isLegalPosition());
+
+    const Position duplicateKing = Position::fromFen(
+        "4k3/8/8/8/8/8/4K3/4K3 w - - 0 1");
+    assert(duplicateKing.isInternallyConsistent());
+    assert(!duplicateKing.isLegalPosition());
+    bool threw = false;
+    try { (void)duplicateKing.kingSquare(Color::White); }
+    catch (const std::invalid_argument&) { threw = true; }
+    assert(threw);
+
+    assert(!Position::fromFen("P3k3/8/8/8/8/8/8/4K3 w - - 0 1")
+                .isLegalPosition());
+    assert(!Position::fromFen("8/8/8/8/8/8/4k3/4K3 w - - 0 1")
+                .isLegalPosition());
+    assert(!Position::fromFen("4k3/8/8/8/8/8/8/4K3 w K - 0 1")
+                .isLegalPosition());
+    assert(!Position::fromFen("4k3/8/8/8/8/8/8/4K3 w - e3 0 1")
+                .isLegalPosition());
+    assert(!Position::fromFen(
+                "4k3/8/8/8/8/3Q4/PPPPPPPP/3QK3 w - - 0 1")
+                .isLegalPosition());
+
+    // The side to move may be in check.
+    assert(Position::fromFen("4r1k1/8/8/8/8/8/8/4K3 w - - 0 1")
+               .isLegalPosition());
+    // The side that just moved may not have left its own king in check.
+    assert(!Position::fromFen("4k3/8/8/8/8/8/8/4R1K1 w - - 0 1")
+                .isLegalPosition());
+
+    const Position legalEp = Position::fromFen(
+        "4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1");
+    assert(legalEp.isLegalPosition());
+}
+
 void testMalformedFen() {
     invalidFen("8/8/8/8/8/8/8 w - - 0 1");
     invalidFen("8/8/8/8/8/8/8/8 x - - 0 1");
@@ -85,5 +144,7 @@ int main() {
     testStart();
     testFenState();
     testEmptyAndPieceTypes();
+    testPositionAccess();
+    testConsistencyAndLegalityAreDistinct();
     testMalformedFen();
 }

@@ -1,0 +1,14 @@
+# CMake build trees and generated files
+/build/
+/CMakeUserPresets.json
+
+# Local packaged binaries (CI publishes release artifacts)
+/artifacts/
+
+# Compiler and editor output
+*.o
+*.obj
+*.exe
+*.out
+.vscode/
+.idea/

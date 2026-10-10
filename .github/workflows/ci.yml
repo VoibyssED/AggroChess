@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: GCC Debug + sanitizers
+            cc: gcc
+            cxx: g++
+            build_type: Debug
+            sanitizers: "ON"
+          - name: GCC Release
+            cc: gcc
+            cxx: g++
+            build_type: Release
+            sanitizers: "OFF"
+          - name: Clang Debug
+            cc: clang
+            cxx: clang++
+            build_type: Debug
+            sanitizers: "OFF"
+          - name: Clang Release
+            cc: clang
+            cxx: clang++
+            build_type: Release
+            sanitizers: "OFF"
+
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DAGGROCHESS_ENABLE_SANITIZERS=${{ matrix.sanitizers }}
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  windows-release:
+    name: Windows Release executable
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Upload AggroChess.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: AggroChess-windows-x64
+          path: build/Release/AggroChess.exe
+          if-no-files-found: error
