@@ -1,5 +1,9 @@
 #include "board.h"
 
+#include "attacks.h"
+#include "zobrist.h"
+
+#include <algorithm>
 #include <bit>
 #include <charconv>
 #include <stdexcept>
@@ -10,6 +14,15 @@ namespace aggrochess {
 namespace {
 constexpr std::size_t colorIndex(Color color) noexcept { return static_cast<std::size_t>(color); }
 constexpr std::size_t pieceIndex(PieceType type) noexcept { return static_cast<std::size_t>(type); }
+
+constexpr std::uint8_t encodePiece(Color color, PieceType type) noexcept {
+    return static_cast<std::uint8_t>(1U + colorIndex(color) * 6U + pieceIndex(type));
+}
+
+constexpr PieceType decodePieceType(std::uint8_t code) noexcept {
+    return code == 0 ? PieceType::Count
+                     : static_cast<PieceType>((code - 1U) % 6U);
+}
 
 PieceType parsePiece(char symbol) {
     switch (static_cast<char>(symbol | 0x20)) {
@@ -80,14 +93,25 @@ Square squareFromString(std::string_view value) {
     return static_cast<Square>((value[1] - '1') * 8 + value[0] - 'a');
 }
 
+void Position::refreshKingSquare(Color color) noexcept {
+    const Bitboard kings = pieces(color, PieceType::King);
+    kingSquares_[colorIndex(color)] = countBits(kings) == 1
+        ? static_cast<Square>(std::countr_zero(kings)) : Square::None;
+}
+
 void Position::placePiece(Color color, PieceType type, Square square) noexcept {
     setSquare(colorBitboards_[colorIndex(color)], square);
     setSquare(pieceBitboards_[pieceIndex(type)], square);
+    pieceCodes_[static_cast<std::size_t>(squareIndex(square))] =
+        encodePiece(color, type);
+    if (type == PieceType::King) refreshKingSquare(color);
 }
 
 void Position::removePiece(Color color, PieceType type, Square square) noexcept {
     clearSquare(colorBitboards_[colorIndex(color)], square);
     clearSquare(pieceBitboards_[pieceIndex(type)], square);
+    pieceCodes_[static_cast<std::size_t>(squareIndex(square))] = 0;
+    if (type == PieceType::King) refreshKingSquare(color);
 }
 
 Position Position::startPosition() {
@@ -146,6 +170,12 @@ Position Position::fromFen(std::string_view fen) {
     position.halfmoveClock_ = parseUnsigned(fields[4], "halfmove clock");
     position.fullmoveNumber_ = parseUnsigned(fields[5], "fullmove number");
     if (position.fullmoveNumber_ == 0) throw std::invalid_argument("FEN fullmove number must be positive");
+    const ZobristKey epKey = zobrist::enPassant(position);
+    if (epKey != 0) {
+        position.enPassantHashFile_ = static_cast<std::uint8_t>(
+            squareIndex(position.enPassantSquare_) % 8 + 1);
+    }
+    position.zobristKey_ = zobrist::compute(position);
     return position;
 }
 
@@ -155,7 +185,31 @@ Bitboard Position::pieces(Color color, PieceType type) const noexcept { return p
 Bitboard Position::occupancy(Color color) const noexcept { return pieces(color); }
 Bitboard Position::allOccupancy() const noexcept { return pieces(Color::White) | pieces(Color::Black); }
 
-bool Position::isValid() const noexcept {
+PieceType Position::pieceTypeAt(Square square) const noexcept {
+    const int index = squareIndex(square);
+    if (index < 0 || index >= 64) return PieceType::Count;
+    return decodePieceType(pieceCodes_[static_cast<std::size_t>(index)]);
+}
+
+Color Position::colorAt(Square square) const {
+    const int index = squareIndex(square);
+    if (index < 0 || index >= 64 ||
+        pieceCodes_[static_cast<std::size_t>(index)] == 0) {
+        throw std::invalid_argument("empty or invalid square has no piece color");
+    }
+    return pieceCodes_[static_cast<std::size_t>(index)] <= 6
+        ? Color::White : Color::Black;
+}
+
+Square Position::kingSquare(Color color) const {
+    const Square square = kingSquares_[colorIndex(color)];
+    if (square == Square::None) {
+        throw std::invalid_argument("position does not contain exactly one king");
+    }
+    return square;
+}
+
+bool Position::isInternallyConsistent() const noexcept {
     if ((castlingRights_ & static_cast<std::uint8_t>(~0x0FU)) != 0) return false;
     if ((pieces(Color::White) & pieces(Color::Black)) != 0) return false;
     Bitboard unionOfTypes = 0;
@@ -176,15 +230,103 @@ bool Position::isValid() const noexcept {
         }
         if (colorPieces != pieces(color)) return false;
     }
+
+    for (int index = 0; index < 64; ++index) {
+        const Square square = static_cast<Square>(index);
+        std::uint8_t expectedCode = 0;
+        if (testSquare(allOccupancy(), square)) {
+            const Color color = testSquare(pieces(Color::White), square)
+                ? Color::White : Color::Black;
+            for (const PieceType type : {PieceType::Pawn, PieceType::Knight,
+                                         PieceType::Bishop, PieceType::Rook,
+                                         PieceType::Queen, PieceType::King}) {
+                if (testSquare(pieces(type), square)) {
+                    expectedCode = encodePiece(color, type);
+                    break;
+                }
+            }
+        }
+        if (pieceCodes_[static_cast<std::size_t>(index)] != expectedCode) return false;
+    }
+
+    for (const Color color : {Color::White, Color::Black}) {
+        const Bitboard kings = pieces(color, PieceType::King);
+        const Square expected = countBits(kings) == 1
+            ? static_cast<Square>(std::countr_zero(kings)) : Square::None;
+        if (kingSquares_[colorIndex(color)] != expected) return false;
+    }
+    std::uint8_t expectedEpHashFile = 0;
+    if (zobrist::enPassant(*this) != 0) {
+        expectedEpHashFile = static_cast<std::uint8_t>(
+            squareIndex(enPassantSquare_) % 8 + 1);
+    }
+    if (enPassantHashFile_ != expectedEpHashFile) return false;
     return true;
+}
+
+bool Position::isLegalPosition() const noexcept {
+    if (!isInternallyConsistent()) return false;
+    if (countBits(pieces(Color::White, PieceType::King)) != 1 ||
+        countBits(pieces(Color::Black, PieceType::King)) != 1) return false;
+    if (countBits(pieces(Color::White, PieceType::Pawn)) > 8 ||
+        countBits(pieces(Color::Black, PieceType::Pawn)) > 8) return false;
+    if (countBits(pieces(Color::White)) > 16 ||
+        countBits(pieces(Color::Black)) > 16) return false;
+    for (const Color color : {Color::White, Color::Black}) {
+        const int missingPawns = 8 - countBits(pieces(color, PieceType::Pawn));
+        const int promotedPieces =
+            std::max(0, countBits(pieces(color, PieceType::Queen)) - 1) +
+            std::max(0, countBits(pieces(color, PieceType::Rook)) - 2) +
+            std::max(0, countBits(pieces(color, PieceType::Bishop)) - 2) +
+            std::max(0, countBits(pieces(color, PieceType::Knight)) - 2);
+        if (promotedPieces > missingPawns) return false;
+    }
+
+    constexpr Bitboard terminalRanks = 0xFF000000000000FFULL;
+    if ((pieces(PieceType::Pawn) & terminalRanks) != 0) return false;
+    if (testSquare(kingAttacks(kingSquares_[colorIndex(Color::White)]),
+                   kingSquares_[colorIndex(Color::Black)])) return false;
+
+    if ((castlingRights_ & WhiteKingSide) != 0 &&
+        (!testSquare(pieces(Color::White, PieceType::King), Square::E1) ||
+         !testSquare(pieces(Color::White, PieceType::Rook), Square::H1))) return false;
+    if ((castlingRights_ & WhiteQueenSide) != 0 &&
+        (!testSquare(pieces(Color::White, PieceType::King), Square::E1) ||
+         !testSquare(pieces(Color::White, PieceType::Rook), Square::A1))) return false;
+    if ((castlingRights_ & BlackKingSide) != 0 &&
+        (!testSquare(pieces(Color::Black, PieceType::King), Square::E8) ||
+         !testSquare(pieces(Color::Black, PieceType::Rook), Square::H8))) return false;
+    if ((castlingRights_ & BlackQueenSide) != 0 &&
+        (!testSquare(pieces(Color::Black, PieceType::King), Square::E8) ||
+         !testSquare(pieces(Color::Black, PieceType::Rook), Square::A8))) return false;
+
+    if (hasEnPassantSquare_) {
+        const int target = squareIndex(enPassantSquare_);
+        const int expectedRank = sideToMove_ == Color::White ? 5 : 2;
+        const int pawnIndex = target + (sideToMove_ == Color::White ? -8 : 8);
+        const int sourceIndex = target + (sideToMove_ == Color::White ? 8 : -8);
+        const Color pawnColor = sideToMove_ == Color::White
+            ? Color::Black : Color::White;
+        if (halfmoveClock_ != 0 || target / 8 != expectedRank ||
+            testSquare(allOccupancy(), enPassantSquare_) || pawnIndex < 0 ||
+            pawnIndex >= 64 || sourceIndex < 0 || sourceIndex >= 64 ||
+            !testSquare(pieces(pawnColor, PieceType::Pawn),
+                        static_cast<Square>(pawnIndex)) ||
+            testSquare(allOccupancy(), static_cast<Square>(sourceIndex))) return false;
+    }
+
+    const Color sideThatJustMoved = sideToMove_ == Color::White
+        ? Color::Black : Color::White;
+    return !isSquareAttacked(*this, kingSquares_[colorIndex(sideThatJustMoved)],
+                             sideToMove_);
 }
 
 namespace {
 
 PieceType pieceAt(const Position& position, Color color, Square square) {
-    for (const auto type : {PieceType::Pawn, PieceType::Knight, PieceType::Bishop,
-                            PieceType::Rook, PieceType::Queen, PieceType::King}) {
-        if (testSquare(position.pieces(color, type), square)) return type;
+    const PieceType type = position.pieceTypeAt(square);
+    if (type != PieceType::Count && testSquare(position.pieces(color), square)) {
+        return type;
     }
     throw std::invalid_argument("move source or capture square has no piece");
 }
@@ -205,7 +347,7 @@ void updateCastlingRights(std::uint8_t& rights, Color color, PieceType movedPiec
         if (from == Square::A8) rights &= ~BlackQueenSide;
         if (from == Square::H8) rights &= ~BlackKingSide;
     }
-    if (undo.hasCapturedPiece && undo.capturedPiece == PieceType::Rook) {
+    if (undo.capturedPiece == PieceType::Rook) {
         if (undo.capturedSquare == Square::A1) rights &= ~WhiteQueenSide;
         if (undo.capturedSquare == Square::H1) rights &= ~WhiteKingSide;
         if (undo.capturedSquare == Square::A8) rights &= ~BlackQueenSide;
@@ -216,7 +358,12 @@ void updateCastlingRights(std::uint8_t& rights, Color color, PieceType movedPiec
 }  // namespace
 
 void makeMove(Position& position, const Move& move, Undo& undo) {
+    if (!move.isValid() || move.isNull()) {
+        throw std::invalid_argument("cannot apply an invalid or null move");
+    }
+#ifndef NDEBUG
     if (!position.isValid()) throw std::invalid_argument("cannot move an invalid position");
+#endif
 
     const Color movingColor = position.sideToMove_;
     const Color enemyColor = movingColor == Color::White ? Color::Black : Color::White;
@@ -280,30 +427,44 @@ void makeMove(Position& position, const Move& move, Undo& undo) {
                                     squareToString(move.to()));
     }
 
-    // All checks above are read-only. Only now snapshot the state and mutate it.
-    undo.colorBitboards = position.colorBitboards_;
-    undo.pieceBitboards = position.pieceBitboards_;
-    undo.sideToMove = position.sideToMove_;
+    // All checks above are read-only. Save only irreversible state; piece
+    // placement is reconstructed from this move when it is unmade.
+    undo.zobristKey = position.zobristKey_;
+    undo.halfmoveClock = position.halfmoveClock_;
+    undo.move = move;
     undo.castlingRights = position.castlingRights_;
     undo.enPassantSquare = position.enPassantSquare_;
     undo.hasEnPassantSquare = position.hasEnPassantSquare_;
-    undo.halfmoveClock = position.halfmoveClock_;
-    undo.fullmoveNumber = position.fullmoveNumber_;
-    undo.hasCapturedPiece = false;
+    undo.enPassantHashFile = position.enPassantHashFile_;
+    undo.capturedPiece = PieceType::Count;
+    undo.capturedSquare = Square::A1;
+
+    // Remove the old state components before updating them. Piece keys are
+    // toggled alongside each corresponding bitboard mutation below.
+    position.zobristKey_ ^= zobrist::castlingRights(position.castlingRights_);
+    if (position.enPassantHashFile_ != 0) {
+        position.zobristKey_ ^= zobrist::enPassantFile(
+            static_cast<int>(position.enPassantHashFile_ - 1U));
+    }
+    position.zobristKey_ ^= zobrist::piece(movingColor, movedPiece, move.from());
 
     if (capture) {
-        undo.hasCapturedPiece = true;
-        undo.capturedColor = enemyColor;
         undo.capturedSquare = captureSquare;
         undo.capturedPiece = pieceAt(position, enemyColor, captureSquare);
+        position.zobristKey_ ^=
+            zobrist::piece(enemyColor, undo.capturedPiece, captureSquare);
         position.removePiece(enemyColor, undo.capturedPiece, captureSquare);
     }
 
     position.removePiece(movingColor, movedPiece, move.from());
     if (move.type() == MoveType::Promotion || move.type() == MoveType::PromotionCapture) {
         position.placePiece(movingColor, move.promotion(), move.to());
+        position.zobristKey_ ^=
+            zobrist::piece(movingColor, move.promotion(), move.to());
     } else {
         position.placePiece(movingColor, movedPiece, move.to());
+        position.zobristKey_ ^=
+            zobrist::piece(movingColor, movedPiece, move.to());
     }
 
     if (move.type() == MoveType::Castle) {
@@ -316,10 +477,16 @@ void makeMove(Position& position, const Move& move, Undo& undo) {
             : (kingSide ? Square::F8 : Square::D8);
         position.removePiece(movingColor, PieceType::Rook, rookFrom);
         position.placePiece(movingColor, PieceType::Rook, rookTo);
+        position.zobristKey_ ^=
+            zobrist::piece(movingColor, PieceType::Rook, rookFrom);
+        position.zobristKey_ ^=
+            zobrist::piece(movingColor, PieceType::Rook, rookTo);
     }
 
     updateCastlingRights(position.castlingRights_, movingColor, movedPiece, move.from(), undo);
+    position.zobristKey_ ^= zobrist::castlingRights(position.castlingRights_);
     position.hasEnPassantSquare_ = false;
+    position.enPassantHashFile_ = 0;
     if (move.type() == MoveType::PawnDoublePush) {
         const int delta = movingColor == Color::White ? 8 : -8;
         position.enPassantSquare_ = static_cast<Square>(squareIndex(move.from()) + delta);
@@ -329,17 +496,60 @@ void makeMove(Position& position, const Move& move, Undo& undo) {
         ? 0 : position.halfmoveClock_ + 1;
     if (movingColor == Color::Black) ++position.fullmoveNumber_;
     position.sideToMove_ = enemyColor;
+    position.zobristKey_ ^= zobrist::sideToMove();
+    if (position.hasEnPassantSquare_ &&
+        (position.pieces(enemyColor, PieceType::Pawn) &
+         pawnAttacks(movingColor, position.enPassantSquare_)) != 0) {
+        const ZobristKey epKey = zobrist::enPassant(position);
+        if (epKey != 0) {
+            position.enPassantHashFile_ = static_cast<std::uint8_t>(
+                squareIndex(position.enPassantSquare_) % 8 + 1);
+            position.zobristKey_ ^= epKey;
+        }
+    }
 }
 
 void unmakeMove(Position& position, const Undo& undo) {
-    position.colorBitboards_ = undo.colorBitboards;
-    position.pieceBitboards_ = undo.pieceBitboards;
-    position.sideToMove_ = undo.sideToMove;
+    const Move& move = undo.move;
+    const Color movingColor = position.sideToMove_ == Color::White
+        ? Color::Black : Color::White;
+    const Color enemyColor = position.sideToMove_;
+    const bool promotion = move.type() == MoveType::Promotion ||
+                           move.type() == MoveType::PromotionCapture;
+
+    if (promotion) {
+        position.removePiece(movingColor, move.promotion(), move.to());
+        position.placePiece(movingColor, PieceType::Pawn, move.from());
+    } else {
+        const PieceType movedPiece = pieceAt(position, movingColor, move.to());
+        position.removePiece(movingColor, movedPiece, move.to());
+        position.placePiece(movingColor, movedPiece, move.from());
+    }
+
+    if (move.type() == MoveType::Castle) {
+        const bool kingSide = squareIndex(move.to()) > squareIndex(move.from());
+        const Square rookFrom = movingColor == Color::White
+            ? (kingSide ? Square::H1 : Square::A1)
+            : (kingSide ? Square::H8 : Square::A8);
+        const Square rookTo = movingColor == Color::White
+            ? (kingSide ? Square::F1 : Square::D1)
+            : (kingSide ? Square::F8 : Square::D8);
+        position.removePiece(movingColor, PieceType::Rook, rookTo);
+        position.placePiece(movingColor, PieceType::Rook, rookFrom);
+    }
+
+    if (undo.capturedPiece != PieceType::Count) {
+        position.placePiece(enemyColor, undo.capturedPiece, undo.capturedSquare);
+    }
+
+    position.sideToMove_ = movingColor;
     position.castlingRights_ = undo.castlingRights;
     position.enPassantSquare_ = undo.enPassantSquare;
     position.hasEnPassantSquare_ = undo.hasEnPassantSquare;
+    position.enPassantHashFile_ = undo.enPassantHashFile;
     position.halfmoveClock_ = undo.halfmoveClock;
-    position.fullmoveNumber_ = undo.fullmoveNumber;
+    if (movingColor == Color::Black) --position.fullmoveNumber_;
+    position.zobristKey_ = undo.zobristKey;
 }
 
 std::string Position::toFen() const {
@@ -348,22 +558,12 @@ std::string Position::toFen() const {
         int empty = 0;
         for (int file = 0; file < 8; ++file) {
             const auto square = static_cast<Square>(rank * 8 + file);
-            PieceType type = PieceType::Count;
-            Color color = Color::White;
-            for (const auto candidateColor : {Color::White, Color::Black}) {
-                for (int index = 0; index < static_cast<int>(PieceType::Count); ++index) {
-                    const auto candidate = static_cast<PieceType>(index);
-                    if (testSquare(pieces(candidateColor, candidate), square)) {
-                        type = candidate;
-                        color = candidateColor;
-                    }
-                }
-            }
+            const PieceType type = pieceTypeAt(square);
             if (type == PieceType::Count) ++empty;
             else {
                 if (empty != 0) result += std::to_string(empty);
                 empty = 0;
-                result += pieceSymbol(type, color);
+                result += pieceSymbol(type, colorAt(square));
             }
         }
         if (empty != 0) result += std::to_string(empty);
